@@ -3,3 +3,6 @@ dist/
 __pycache__/
 *.py[cod]
 .pnpm-store/
+release/
+py_modules/vendor/
+bin/claude/

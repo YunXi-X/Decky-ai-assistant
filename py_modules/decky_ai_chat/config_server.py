@@ -86,17 +86,7 @@ class PhoneConfigServer:
                     length = int(self.headers.get("Content-Length", "0"))
                     raw = self.rfile.read(length).decode("utf-8")
                     form = parse_qs(raw, keep_blank_values=True)
-                    updates = {
-                        "provider": "openai",
-                        "endpoint": self._one(form, "endpoint"),
-                        "model": self._one(form, "model"),
-                        "system_prompt": self._one(form, "system_prompt"),
-                        "temperature": self._one(form, "temperature"),
-                        "max_history": self._one(form, "max_history"),
-                        "verify_ssl": "verify_ssl" in form,
-                    }
-                    api_key = self._one(form, "api_key")
-                    updates["api_key"] = api_key if api_key else "__KEEP__"
+                    updates = outer._updates_from_form(form)
                     public_config = outer.config_store.save(updates)
                     outer.logger.info(
                         "AI Chat phone config saved: "
@@ -104,12 +94,14 @@ class PhoneConfigServer:
                         f"endpoint={public_config.get('endpoint')} "
                         f"model={public_config.get('model')} "
                         f"has_api_key={public_config.get('has_api_key')} "
+                        f"steam_id={public_config.get('steam_id')} "
+                        f"has_steam_api_key={public_config.get('has_steam_api_key')} "
                         f"path={public_config.get('config_path')}"
                     )
                     self._html(outer._saved_page(public_config))
                 except Exception as exc:
                     outer.logger.exception("AI Chat phone config save failed")
-                    self._text(f"Save failed: {exc}", 500)
+                    self._text(f"保存失败：{exc}", 500)
 
             def log_message(self, fmt, *args):
                 outer.logger.info("phone-config " + fmt % args)
@@ -147,6 +139,30 @@ class PhoneConfigServer:
 
         return Handler
 
+    def _updates_from_form(self, form: dict[str, list[str]]) -> dict[str, Any]:
+        updates = {
+            "mode": "agent",
+            "provider": "openai",
+            "endpoint": self._one(form, "endpoint"),
+            "model": self._one(form, "model"),
+            "system_prompt": self._one(form, "system_prompt"),
+            "temperature": self._one(form, "temperature"),
+            "max_history": self._one(form, "max_history"),
+            "verify_ssl": "verify_ssl" in form,
+            "steam_id": self._one(form, "steam_id"),
+            "steam_include_free_games": "steam_include_free_games" in form,
+            "steam_cache_seconds": self._one(form, "steam_cache_seconds"),
+            "steam_api_timeout_seconds": self._one(form, "steam_api_timeout_seconds"),
+        }
+        api_key = self._one(form, "api_key")
+        steam_api_key = self._one(form, "steam_api_key")
+        updates["api_key"] = api_key if api_key else "__KEEP__"
+        updates["steam_api_key"] = steam_api_key if steam_api_key else "__KEEP__"
+        return updates
+
+    def _one(self, form: dict[str, list[str]], key: str) -> str:
+        return form.get(key, [""])[0].strip()
+
     def _page(self) -> str:
         config = self.config_store.public_config()
         endpoint = html.escape(str(config.get("endpoint", "")), quote=True)
@@ -156,12 +172,17 @@ class PhoneConfigServer:
         max_history = html.escape(str(config.get("max_history", "16")), quote=True)
         verify_ssl_checked = "checked" if config.get("verify_ssl", True) else ""
         has_key = "saved" if config.get("has_api_key") else "not saved"
+        steam_id = html.escape(str(config.get("steam_id", "")), quote=True)
+        has_steam_key = "saved" if config.get("has_steam_api_key") else "not saved"
+        steam_include_free_checked = "checked" if config.get("steam_include_free_games", True) else ""
+        steam_cache_seconds = html.escape(str(config.get("steam_cache_seconds", "1800")), quote=True)
+        steam_api_timeout_seconds = html.escape(str(config.get("steam_api_timeout_seconds", "5")), quote=True)
         return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AI Chat Setup</title>
+  <title>AI 助手配置</title>
   <style>
     body {{ margin: 0; background: #151515; color: #f4f4f4; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
     main {{ max-width: 560px; margin: 0 auto; padding: 24px 16px 40px; }}
@@ -177,42 +198,63 @@ class PhoneConfigServer:
 </head>
 <body>
   <main>
-    <h1>AI Chat Setup</h1>
-    <p>在手机上填写模型服务信息，保存后 Steam Deck 插件会直接读取配置。API Key 当前状态：{has_key}。</p>
+    <h1>AI 助手配置</h1>
+    <p>在手机上填写模型服务和 Steam Web API 信息，保存后 Steam Deck 插件会直接读取配置。AI API Key 当前状态：{has_key}。</p>
     <form method="post" action="/save?token={self.token}" class="card">
-      <label>Preset
+      <p class="hint">当前固定为 Agent 工具模式。写文件和 shell 命令会先回到 Decky 前端请求确认。</p>
+      <h2>模型服务</h2>
+      <label>预设
         <select id="preset">
           <option value="deepseek">DeepSeek Flash</option>
           <option value="deepseek-pro">DeepSeek Pro</option>
           <option value="kimi">Kimi</option>
           <option value="kimi-code">Kimi Code</option>
-          <option value="custom">Custom OpenAI-compatible</option>
+          <option value="custom">自定义 OpenAI 兼容接口</option>
         </select>
       </label>
-      <label>Endpoint / Base URL
+      <label>接口地址 / Base URL
         <input id="endpoint" name="endpoint" value="{endpoint}">
       </label>
-      <label>Model
+      <label>模型
         <input id="model" name="model" value="{model}">
       </label>
       <label>API Key
         <input name="api_key" type="password" placeholder="留空则保留已保存的 key">
       </label>
-      <label>System Prompt
+      <label>系统提示词
         <textarea name="system_prompt">{system_prompt}</textarea>
       </label>
-      <label>Temperature
+      <label>温度
         <input name="temperature" type="number" min="0" max="2" step="0.1" value="{temperature}">
       </label>
-      <label>Max History
+      <label>最大历史消息数
         <input name="max_history" type="number" min="2" max="40" step="1" value="{max_history}">
       </label>
       <label>
         <input name="verify_ssl" type="checkbox" {verify_ssl_checked} style="width: auto; margin-right: 8px;">
-        Verify TLS certificate
+        校验 TLS 证书
       </label>
       <p class="hint">如果 Steam Deck 的代理或网关使用自签证书导致 CERTIFICATE_VERIFY_FAILED，可以临时取消勾选。只建议在可信网络中这样做。</p>
-      <button type="submit">Save to Steam Deck</button>
+      <h2>Steam Web API</h2>
+      <p class="hint">SteamID64 可以在 Decky 里自动检测。Steam Web API Key 需要你在手机浏览器登录 Steam 后手动复制粘贴。</p>
+      <label>SteamID64
+        <input name="steam_id" inputmode="numeric" value="{steam_id}" placeholder="留空则自动检测，或填写你的 SteamID64">
+      </label>
+      <label>Steam Web API Key
+        <input name="steam_api_key" type="password" placeholder="当前状态：{has_steam_key}；留空则保留已保存的 key">
+      </label>
+      <p class="hint"><a href="https://steamcommunity.com/dev/apikey" target="_blank" rel="noopener noreferrer">打开 Steam Web API Key 页面</a>。如果 Steam 要求域名，可以填 localhost。</p>
+      <label>
+        <input name="steam_include_free_games" type="checkbox" {steam_include_free_checked} style="width: auto; margin-right: 8px;">
+        Steam 游戏库包含免费游戏
+      </label>
+      <label>Steam 数据缓存秒数
+        <input name="steam_cache_seconds" type="number" min="60" max="86400" step="60" value="{steam_cache_seconds}">
+      </label>
+      <label>Steam API 超时秒数
+        <input name="steam_api_timeout_seconds" type="number" min="2" max="20" step="1" value="{steam_api_timeout_seconds}">
+      </label>
+      <button type="submit">保存到 Steam Deck</button>
     </form>
     <p class="hint">建议只在你的家庭局域网使用。此页面 URL 带一次随机 token，不要发给别人。</p>
   </main>
@@ -238,12 +280,14 @@ class PhoneConfigServer:
         model = html.escape(str(config.get("model", "")))
         path = html.escape(str(config.get("config_path", "")))
         has_key = "yes" if config.get("has_api_key") else "no"
+        steam_id = html.escape(str(config.get("steam_id", "")))
+        has_steam_key = "yes" if config.get("has_steam_api_key") else "no"
         return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Saved</title>
+  <title>已保存</title>
   <style>
     body {{ margin: 0; background: #151515; color: #f4f4f4; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
     main {{ max-width: 560px; margin: 0 auto; padding: 32px 16px; text-align: center; }}
@@ -260,13 +304,17 @@ class PhoneConfigServer:
     <h1>已保存</h1>
     <p>回到 Steam Deck 插件，重新打开设置或直接开始对话即可。</p>
     <dl>
-      <dt>API Key saved</dt>
+      <dt>API Key 已保存</dt>
       <dd>{has_key}</dd>
-      <dt>Endpoint</dt>
+      <dt>接口地址</dt>
       <dd>{endpoint}</dd>
-      <dt>Model</dt>
+      <dt>模型</dt>
       <dd>{model}</dd>
-      <dt>Config path</dt>
+      <dt>SteamID64</dt>
+      <dd>{steam_id or "未填写"}</dd>
+      <dt>Steam Web API Key 已保存</dt>
+      <dd>{has_steam_key}</dd>
+      <dt>配置路径</dt>
       <dd>{path}</dd>
     </dl>
   </main>

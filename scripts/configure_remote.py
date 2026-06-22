@@ -61,10 +61,11 @@ def build_config(args: argparse.Namespace) -> dict:
     endpoint = args.endpoint or preset.endpoint
     model = args.model or preset.model
     if args.preset == "custom":
-        endpoint = prompt(endpoint, "Endpoint / base URL")
-        model = prompt(model, "Model")
+        endpoint = prompt(endpoint, "接口地址 / Base URL")
+        model = prompt(model, "模型")
 
     return {
+        "mode": args.mode,
         "provider": preset.provider,
         "endpoint": endpoint,
         "model": model,
@@ -74,6 +75,7 @@ def build_config(args: argparse.Namespace) -> dict:
         "max_history": args.max_history,
         "ragflow_chat_id": "",
         "ragflow_session_id": "",
+        "verify_ssl": True,
     }
 
 
@@ -114,10 +116,16 @@ def main() -> None:
     )
     parser.add_argument(
         "--system-prompt",
-        default="You are a concise, helpful assistant running inside Steam Deck game mode.",
+        default="你是运行在 Steam Deck 游戏模式中的中文 AI 助手。请默认使用简体中文回答，除非用户明确要求其他语言。回答应简洁、具体、可执行。",
     )
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max-history", type=int, default=16)
+    parser.add_argument(
+        "--mode",
+        choices=["chat", "agent"],
+        default="agent",
+        help="运行模式。当前插件默认使用 agent。",
+    )
     parser.add_argument(
         "--no-restart",
         action="store_true",

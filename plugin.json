@@ -1,6 +1,6 @@
 {
-  "name": "AI Chat",
-  "author": "radiant",
+  "name": "AI 助手",
+  "author": "Decky AI Assistant Contributors",
   "flags": [
     "debug"
   ],
@@ -11,7 +11,7 @@
       "chat",
       "assistant"
     ],
-    "description": "A Decky Loader chat panel for AI assistants in Steam Deck game mode.",
+    "description": "Steam Deck 游戏模式下的 AI 助手聊天面板。",
     "image": "https://opengraph.githubassets.com/1/SteamDeckHomebrew/decky-plugin-template"
   }
 }

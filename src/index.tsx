@@ -1,13 +1,15 @@
 import { staticClasses, TextField } from "@decky/ui";
 import { callable, definePlugin, toaster } from "@decky/api";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ChangeEvent, CSSProperties, KeyboardEvent } from "react";
+import type { ChangeEvent, CSSProperties, KeyboardEvent, ReactNode } from "react";
+import katex from "katex";
 import QRCode from "qrcode";
+import { isTableStart, splitTableRow, tableAlignments } from "./markdown_table";
 import {
+  FaArrowDown,
   FaArrowUp,
   FaCheck,
   FaCog,
-  FaPlus,
   FaQrcode,
   FaRobot,
   FaSave,
@@ -16,17 +18,34 @@ import {
 } from "react-icons/fa";
 
 type Role = "assistant" | "user";
-type Provider = "mock" | "openai" | "langchain" | "ragflow";
+type Provider = "openai" | "claude-code-cli";
+type ChatMode = "chat" | "agent";
+
+type ToolEvent = {
+  name: string;
+  status: string;
+  detail: string;
+  action_id?: string;
+};
 
 type ChatMessage = {
   id: string;
   role: Role;
   text: string;
   error?: boolean;
+  toolEvents?: ToolEvent[];
+  suggestions?: string[];
 };
 
 type ChatRequest = {
   prompt: string;
+  conversation_id?: string;
+  claude_session_id?: string;
+  game?: {
+    appid?: number;
+    name?: string;
+  };
+  skip_conversation_save?: boolean;
   override_config?: boolean;
   provider?: Provider;
   model?: string;
@@ -45,10 +64,30 @@ type ChatResponse = {
   provider: Provider;
   model: string;
   endpoint: string;
-  metadata?: Record<string, unknown>;
+  metadata?: {
+    tool_events?: ToolEvent[];
+    [key: string]: unknown;
+  };
+};
+
+type StreamStartResponse = {
+  ok: boolean;
+  stream_id?: string;
+  message?: string;
+};
+
+type StreamPollResponse = {
+  ok: boolean;
+  stream_id?: string;
+  events: ToolEvent[];
+  cursor: number;
+  done: boolean;
+  response?: ChatResponse | null;
+  message?: string;
 };
 
 type BackendConfig = {
+  mode: ChatMode;
   provider: Provider;
   endpoint: string;
   model: string;
@@ -59,6 +98,15 @@ type BackendConfig = {
   ragflow_chat_id: string;
   ragflow_session_id: string;
   has_api_key: boolean;
+  steam_id: string;
+  steam_include_free_games: boolean;
+  steam_cache_seconds: number;
+  has_steam_api_key: boolean;
+  agent_backend: string;
+  claude_code_path: string;
+  claude_permission_mode: string;
+  claude_timeout_seconds: number;
+  claude_bare_mode: boolean;
 };
 
 type BackendStatus = {
@@ -76,7 +124,47 @@ type PairingInfo = {
   message?: string;
 };
 
-const askAi = callable<[request: ChatRequest], ChatResponse>("ask_ai");
+type SteamStatus = {
+  ok: boolean;
+  steam_id: string;
+  has_api_key: boolean;
+  local_library_count: number;
+  saved_steam_id?: boolean;
+  detected?: {
+    ok?: boolean;
+    steam_id?: string;
+    account_name?: string;
+    persona_name?: string;
+    source?: string;
+    message?: string;
+  };
+  message?: string;
+};
+
+type ActiveConversation = {
+  conversation_id: string;
+  claude_session_id: string;
+  title: string;
+  game?: {
+    appid?: number;
+    name?: string;
+  };
+  running_game?: {
+    ok?: boolean;
+    appid?: number;
+    name?: string;
+    message?: string;
+  };
+  messages: Array<Pick<ChatMessage, "role" | "text">>;
+};
+
+const startAiStream = callable<[request: ChatRequest], StreamStartResponse>(
+  "start_ai_stream",
+);
+const pollAiStream = callable<
+  [streamId: string, cursor: number],
+  StreamPollResponse
+>("poll_ai_stream");
 const getConfig = callable<[], BackendConfig>("get_config");
 const saveConfig = callable<[updates: Record<string, unknown>], BackendConfig>(
   "save_config",
@@ -86,37 +174,85 @@ const checkBackend = callable<
   BackendStatus
 >("check_backend");
 const getPairingInfo = callable<[], PairingInfo>("get_pairing_info");
+const detectSteamStatus = callable<[], SteamStatus>("detect_steam_status");
+const getActiveConversation = callable<[], ActiveConversation>(
+  "get_active_conversation",
+);
+const clearActiveConversation = callable<
+  [conversationId?: string],
+  ActiveConversation
+>("clear_active_conversation");
 
-const initialMessages: ChatMessage[] = [
-  {
-    id: "welcome",
-    role: "assistant",
-    text: "Ready. Ask for game tips, settings advice, build notes, or anything else.",
-  },
-];
+const initialMessages: ChatMessage[] = [];
 
 const quickPrompts = [
-  "Suggest Steam Deck settings for the current game.",
-  "Summarize a spoiler-free beginner strategy.",
-  "Help me debug why this game stutters.",
+  "帮我推荐当前游戏的 Steam Deck 画面和功耗设置。",
+  "给我一份无剧透的新手入门策略。",
+  "帮我排查这个游戏为什么会卡顿。",
 ];
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const inputCss = `
+.decky-ai-chat-input,
+.decky-ai-chat-input * {
+  background: transparent !important;
+}
+.decky-ai-chat-input input,
+.decky-ai-chat-input textarea {
+  background: transparent !important;
+  color: #f4f4f4 !important;
+  box-shadow: none !important;
+  border-color: transparent !important;
+}
+.decky-ai-chat-input input::placeholder,
+.decky-ai-chat-input textarea::placeholder {
+  color: rgba(244, 244, 244, 0.42) !important;
+}
+.decky-ai-chat-shell {
+  position: relative;
+}
+@keyframes decky-ai-thinking-dot {
+  0%, 80%, 100% {
+    opacity: 0.28;
+    transform: translateY(0);
+  }
+  40% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+.decky-ai-thinking-dot {
+  display: inline-block;
+  animation: decky-ai-thinking-dot 1.2s infinite ease-in-out;
+}
+.decky-ai-thinking-dot:nth-child(2) {
+  animation-delay: 0.16s;
+}
+.decky-ai-thinking-dot:nth-child(3) {
+  animation-delay: 0.32s;
+}
+`;
 
 const styles: Record<string, CSSProperties> = {
   shell: {
     display: "flex",
     flexDirection: "column",
-    height: "calc(100vh - 92px)",
-    minHeight: "520px",
+    height: "100%",
+    minHeight: 0,
+    boxSizing: "border-box",
     margin: "-10px -8px 0",
     background: "#151515",
     color: "#f4f4f4",
+    overflow: "hidden",
   },
   topBar: {
     display: "flex",
     alignItems: "center",
     justifyContent: "space-between",
     gap: "8px",
-    padding: "10px 12px",
+    flex: "0 0 auto",
+    padding: "7px 10px",
     borderBottom: "1px solid rgba(255, 255, 255, 0.08)",
     background: "rgba(21, 21, 21, 0.96)",
   },
@@ -130,14 +266,14 @@ const styles: Record<string, CSSProperties> = {
     overflow: "hidden",
     textOverflow: "ellipsis",
     whiteSpace: "nowrap",
-    fontSize: "15px",
+    fontSize: "14px",
     fontWeight: 700,
   },
   modelStatus: {
     display: "flex",
     alignItems: "center",
     gap: "6px",
-    fontSize: "12px",
+    fontSize: "11px",
     color: "rgba(244, 244, 244, 0.62)",
   },
   topActions: {
@@ -149,8 +285,8 @@ const styles: Record<string, CSSProperties> = {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    width: "34px",
-    height: "34px",
+    width: "30px",
+    height: "30px",
     borderRadius: "999px",
     border: "1px solid rgba(255, 255, 255, 0.12)",
     background: "rgba(255, 255, 255, 0.07)",
@@ -216,9 +352,29 @@ const styles: Record<string, CSSProperties> = {
     display: "flex",
     flexDirection: "column",
     flex: 1,
+    minHeight: 0,
     gap: "15px",
     overflowY: "auto",
-    padding: "18px 12px 16px",
+    padding: "12px 10px 10px",
+    overscrollBehavior: "contain",
+    background: "#151515",
+  },
+  scrollToBottomButton: {
+    position: "absolute",
+    right: "18px",
+    bottom: "62px",
+    zIndex: 2,
+    display: "inline-flex",
+    alignItems: "center",
+    justifyContent: "center",
+    width: "34px",
+    height: "34px",
+    borderRadius: "999px",
+    border: "1px solid rgba(255, 255, 255, 0.14)",
+    background: "#2b2b2b",
+    color: "#f4f4f4",
+    boxShadow: "0 8px 20px rgba(0, 0, 0, 0.35)",
+    font: "inherit",
   },
   emptyState: {
     display: "flex",
@@ -308,6 +464,95 @@ const styles: Record<string, CSSProperties> = {
     paddingLeft: 0,
     color: "#f4f4f4",
   },
+  markdown: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "8px",
+  },
+  markdownParagraph: {
+    margin: 0,
+    whiteSpace: "pre-wrap",
+  },
+  markdownHeading: {
+    margin: "2px 0 0",
+    fontSize: "15px",
+    fontWeight: 750,
+  },
+  markdownList: {
+    margin: 0,
+    paddingLeft: "18px",
+  },
+  markdownCodeBlock: {
+    margin: 0,
+    maxHeight: "220px",
+    overflow: "auto",
+    whiteSpace: "pre-wrap",
+    borderRadius: "8px",
+    background: "#101010",
+    border: "1px solid rgba(255, 255, 255, 0.09)",
+    padding: "9px",
+    fontSize: "11px",
+    lineHeight: 1.4,
+  },
+  markdownInlineCode: {
+    borderRadius: "5px",
+    background: "rgba(255, 255, 255, 0.09)",
+    padding: "1px 4px",
+    fontSize: "0.92em",
+  },
+  markdownLink: {
+    color: "#8cc8ff",
+    textDecoration: "underline",
+  },
+  markdownRule: {
+    width: "100%",
+    border: 0,
+    borderTop: "1px solid rgba(255, 255, 255, 0.16)",
+    margin: "4px 0",
+  },
+  markdownQuote: {
+    margin: 0,
+    borderLeft: "3px solid rgba(255, 255, 255, 0.18)",
+    paddingLeft: "10px",
+    color: "rgba(244, 244, 244, 0.72)",
+  },
+  markdownTableWrap: {
+    maxWidth: "100%",
+    overflowX: "auto",
+    borderRadius: "8px",
+    border: "1px solid rgba(255, 255, 255, 0.10)",
+  },
+  markdownTable: {
+    width: "100%",
+    borderCollapse: "collapse",
+    fontSize: "12px",
+  },
+  markdownTh: {
+    borderBottom: "1px solid rgba(255, 255, 255, 0.14)",
+    background: "rgba(255, 255, 255, 0.07)",
+    padding: "6px 8px",
+    textAlign: "left",
+    fontWeight: 750,
+  },
+  markdownTd: {
+    borderTop: "1px solid rgba(255, 255, 255, 0.08)",
+    padding: "6px 8px",
+    verticalAlign: "top",
+  },
+  markdownMathBlock: {
+    maxWidth: "100%",
+    overflowX: "auto",
+    borderRadius: "8px",
+    background: "rgba(255, 255, 255, 0.06)",
+    padding: "9px",
+    textAlign: "center",
+  },
+  markdownMathInline: {
+    display: "inline-block",
+    maxWidth: "100%",
+    overflowX: "auto",
+    verticalAlign: "middle",
+  },
   userMessage: {
     borderRadius: "18px",
     background: "#303030",
@@ -318,16 +563,95 @@ const styles: Record<string, CSSProperties> = {
     background: "rgba(255, 82, 82, 0.12)",
     color: "#ffb7b7",
   },
+  toolTrace: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "6px",
+    marginTop: "10px",
+    borderTop: "1px solid rgba(255, 255, 255, 0.10)",
+    paddingTop: "8px",
+  },
+  toolEvent: {
+    borderRadius: "8px",
+    background: "rgba(255, 255, 255, 0.07)",
+    padding: "7px 8px",
+    fontSize: "11px",
+    color: "rgba(244, 244, 244, 0.76)",
+  },
+  toolTraceToggle: {
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: "8px",
+    width: "100%",
+    marginTop: "10px",
+    border: "1px solid rgba(255, 255, 255, 0.10)",
+    borderRadius: "9px",
+    background: "rgba(255, 255, 255, 0.06)",
+    color: "rgba(244, 244, 244, 0.76)",
+    padding: "7px 8px",
+    font: "inherit",
+    fontSize: "11px",
+    textAlign: "left",
+  },
+  suggestionRow: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "6px",
+    marginTop: "12px",
+    borderTop: "1px solid rgba(255, 255, 255, 0.10)",
+    paddingTop: "9px",
+  },
+  suggestionTitle: {
+    color: "rgba(244, 244, 244, 0.52)",
+    fontSize: "11px",
+  },
+  followupButton: {
+    width: "100%",
+    borderRadius: "10px",
+    border: "1px solid rgba(255, 255, 255, 0.10)",
+    background: "rgba(255, 255, 255, 0.06)",
+    color: "#f4f4f4",
+    padding: "8px 9px",
+    font: "inherit",
+    fontSize: "12px",
+    lineHeight: 1.3,
+    textAlign: "left",
+  },
+  toolResult: {
+    display: "flex",
+    flexDirection: "column",
+    gap: "7px",
+    marginTop: "10px",
+    borderRadius: "10px",
+    border: "1px solid rgba(140, 200, 255, 0.22)",
+    background: "rgba(140, 200, 255, 0.08)",
+    padding: "9px",
+    fontSize: "12px",
+  },
+  toolResultTitle: {
+    fontWeight: 750,
+    color: "#8cc8ff",
+  },
   typing: {
     display: "inline-flex",
     alignItems: "center",
     gap: "4px",
     color: "rgba(244, 244, 244, 0.64)",
   },
+  thinkingDots: {
+    display: "inline-flex",
+    width: "18px",
+    justifyContent: "space-between",
+    marginLeft: "2px",
+  },
   composerWrap: {
-    padding: "10px 10px 12px",
+    position: "relative",
+    zIndex: 1,
+    flex: "0 0 auto",
+    padding: "6px 8px 8px",
     borderTop: "1px solid rgba(255, 255, 255, 0.08)",
-    background: "rgba(21, 21, 21, 0.98)",
+    background: "#151515",
   },
   composer: {
     display: "flex",
@@ -336,7 +660,7 @@ const styles: Record<string, CSSProperties> = {
     borderRadius: "22px",
     border: "1px solid rgba(255, 255, 255, 0.12)",
     background: "#242424",
-    padding: "7px",
+    padding: "5px",
   },
   textarea: {
     flex: 1,
@@ -358,10 +682,15 @@ const styles: Record<string, CSSProperties> = {
     flex: 1,
     minWidth: 0,
     margin: "-6px 0",
+    borderRadius: "18px",
+    background: "transparent",
+    overflow: "hidden",
   },
   compactTextField: {
     minHeight: "32px",
     padding: 0,
+    background: "transparent",
+    color: "#f4f4f4",
   },
   field: {
     display: "flex",
@@ -422,8 +751,8 @@ const styles: Record<string, CSSProperties> = {
     display: "inline-flex",
     alignItems: "center",
     justifyContent: "center",
-    width: "32px",
-    height: "32px",
+    width: "30px",
+    height: "30px",
     flex: "0 0 auto",
     borderRadius: "999px",
     border: 0,
@@ -435,34 +764,418 @@ const styles: Record<string, CSSProperties> = {
     background: "rgba(244, 244, 244, 0.22)",
     color: "rgba(21, 21, 21, 0.45)",
   },
-  composerHint: {
-    marginTop: "6px",
-    textAlign: "center",
-    fontSize: "11px",
-    color: "rgba(244, 244, 244, 0.42)",
-  },
 };
 
 function id(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
+function isSafeUrl(value: string): boolean {
+  return /^(https?:|mailto:)/i.test(value);
+}
+
+function renderMath(formula: string, displayMode: boolean, key: string): ReactNode {
+  try {
+    return (
+      <span
+        key={key}
+        style={displayMode ? styles.markdownMathBlock : styles.markdownMathInline}
+        dangerouslySetInnerHTML={{
+          __html: katex.renderToString(formula, {
+            displayMode,
+            output: "mathml",
+            throwOnError: false,
+            trust: false,
+          }),
+        }}
+      />
+    );
+  } catch {
+    return (
+      <code key={key} style={styles.markdownInlineCode}>
+        {displayMode ? `$$${formula}$$` : `$${formula}$`}
+      </code>
+    );
+  }
+}
+
+function renderInlineMarkdown(text: string, keyPrefix: string): ReactNode[] {
+  const nodes: ReactNode[] = [];
+  const pattern = /(`[^`]+`|\$[^$\n]+\$|\*\*[^*]+\*\*|\[[^\]]+\]\([^)]+\))/g;
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+
+  while ((match = pattern.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index));
+    }
+
+    const token = match[0];
+    const key = `${keyPrefix}-${match.index}`;
+    if (token.startsWith("`")) {
+      nodes.push(
+        <code key={key} style={styles.markdownInlineCode}>
+          {token.slice(1, -1)}
+        </code>,
+      );
+    } else if (token.startsWith("$")) {
+      nodes.push(renderMath(token.slice(1, -1), false, key));
+    } else if (token.startsWith("**")) {
+      nodes.push(<strong key={key}>{token.slice(2, -2)}</strong>);
+    } else {
+      const link = /^\[([^\]]+)\]\(([^)]+)\)$/.exec(token);
+      if (link && isSafeUrl(link[2])) {
+        nodes.push(
+          <a key={key} href={link[2]} rel="noreferrer" style={styles.markdownLink}>
+            {link[1]}
+          </a>,
+        );
+      } else {
+        nodes.push(token);
+      }
+    }
+    lastIndex = pattern.lastIndex;
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+  return nodes;
+}
+
+function isHorizontalRule(line: string): boolean {
+  return /^\s{0,3}(-{3,}|\*{3,}|_{3,})\s*$/.test(line);
+}
+
+function stripBlockquoteMarker(line: string): string {
+  return line.replace(/^\s*(?:>\s*)+/, "");
+}
+
+function cleanHeadingText(text: string): string {
+  return stripBlockquoteMarker(text).replace(/^\s*(?:>\s*)+/, "").trim();
+}
+
+function renderTable(
+  headerLine: string,
+  separatorLine: string,
+  rowLines: string[],
+  keyPrefix: string,
+): ReactNode {
+  const headers = splitTableRow(headerLine);
+  const alignments = tableAlignments(separatorLine);
+  const rows = rowLines.map(splitTableRow);
+
+  return (
+    <div key={`${keyPrefix}-table`} style={styles.markdownTableWrap}>
+      <table style={styles.markdownTable}>
+        <thead>
+          <tr>
+            {headers.map((header, index) => (
+              <th
+                key={`${keyPrefix}-th-${index}`}
+                style={{
+                  ...styles.markdownTh,
+                  textAlign: alignments[index] || "left",
+                }}
+              >
+                {renderInlineMarkdown(header, `${keyPrefix}-th-${index}`)}
+              </th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((row, rowIndex) => (
+            <tr key={`${keyPrefix}-tr-${rowIndex}`}>
+              {headers.map((_, cellIndex) => (
+                <td
+                  key={`${keyPrefix}-td-${rowIndex}-${cellIndex}`}
+                  style={{
+                    ...styles.markdownTd,
+                    textAlign: alignments[cellIndex] || "left",
+                  }}
+                >
+                  {renderInlineMarkdown(
+                    row[cellIndex] || "",
+                    `${keyPrefix}-td-${rowIndex}-${cellIndex}`,
+                  )}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function renderMarkdownBlocks(lines: string[], keyPrefix: string): ReactNode[] {
+  const blocks: ReactNode[] = [];
+  let index = 0;
+
+  while (index < lines.length) {
+    const line = stripBlockquoteMarker(lines[index]);
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+
+    if (isHorizontalRule(line)) {
+      blocks.push(<hr key={`${keyPrefix}-hr-${index}`} style={styles.markdownRule} />);
+      index += 1;
+      continue;
+    }
+
+    const heading = /^(#{1,3})\s+(.+)$/.exec(line);
+    if (heading) {
+      blocks.push(
+        <div key={`${keyPrefix}-h-${index}`} style={styles.markdownHeading}>
+          {renderInlineMarkdown(cleanHeadingText(heading[2]), `${keyPrefix}-h-${index}`)}
+        </div>,
+      );
+      index += 1;
+      continue;
+    }
+
+    if (isTableStart(lines, index)) {
+      const headerLine = lines[index];
+      const separatorLine = lines[index + 1];
+      const rowLines: string[] = [];
+      index += 2;
+      while (
+        index < lines.length &&
+        stripBlockquoteMarker(lines[index]).includes("|") &&
+        stripBlockquoteMarker(lines[index]).trim()
+      ) {
+        rowLines.push(lines[index]);
+        index += 1;
+      }
+      blocks.push(renderTable(headerLine, separatorLine, rowLines, `${keyPrefix}-table-${index}`));
+      continue;
+    }
+
+    if (/^\s*[-*]\s+/.test(line)) {
+      const items: ReactNode[] = [];
+      while (index < lines.length && /^\s*[-*]\s+/.test(stripBlockquoteMarker(lines[index]))) {
+        const item = stripBlockquoteMarker(lines[index]).replace(/^\s*[-*]\s+/, "");
+        items.push(
+          <li key={`${keyPrefix}-ul-${index}`}>
+            {renderInlineMarkdown(item, `${keyPrefix}-ul-${index}`)}
+          </li>,
+        );
+        index += 1;
+      }
+      blocks.push(
+        <ul key={`${keyPrefix}-ul-block-${index}`} style={styles.markdownList}>
+          {items}
+        </ul>,
+      );
+      continue;
+    }
+
+    if (/^\s*\d+\.\s+/.test(line)) {
+      const items: ReactNode[] = [];
+      while (index < lines.length && /^\s*\d+\.\s+/.test(stripBlockquoteMarker(lines[index]))) {
+        const item = stripBlockquoteMarker(lines[index]).replace(/^\s*\d+\.\s+/, "");
+        items.push(
+          <li key={`${keyPrefix}-ol-${index}`}>
+            {renderInlineMarkdown(item, `${keyPrefix}-ol-${index}`)}
+          </li>,
+        );
+        index += 1;
+      }
+      blocks.push(
+        <ol key={`${keyPrefix}-ol-block-${index}`} style={styles.markdownList}>
+          {items}
+        </ol>,
+      );
+      continue;
+    }
+
+    const paragraph: string[] = [];
+    while (
+      index < lines.length &&
+      stripBlockquoteMarker(lines[index]).trim() &&
+      !/^(#{1,3})\s+/.test(stripBlockquoteMarker(lines[index])) &&
+      !isHorizontalRule(stripBlockquoteMarker(lines[index])) &&
+      !isTableStart(lines, index) &&
+      !/^\s*[-*]\s+/.test(stripBlockquoteMarker(lines[index])) &&
+      !/^\s*\d+\.\s+/.test(stripBlockquoteMarker(lines[index]))
+    ) {
+      paragraph.push(stripBlockquoteMarker(lines[index]));
+      index += 1;
+    }
+    blocks.push(
+      <p key={`${keyPrefix}-p-${index}`} style={styles.markdownParagraph}>
+        {renderInlineMarkdown(paragraph.join("\n"), `${keyPrefix}-p-${index}`)}
+      </p>,
+    );
+  }
+
+  return blocks;
+}
+
+function renderMarkdown(text: string, keyPrefix: string): ReactNode {
+  const blocks: ReactNode[] = [];
+  const lines = text.split(/\r?\n/);
+  let plainLines: string[] = [];
+  let codeLines: string[] = [];
+  let mathLines: string[] = [];
+  let inCode = false;
+  let inMath = false;
+
+  const flushPlain = (index: number) => {
+    if (plainLines.length) {
+      blocks.push(...renderMarkdownBlocks(plainLines, `${keyPrefix}-plain-${index}`));
+      plainLines = [];
+    }
+  };
+
+  lines.forEach((line, index) => {
+    if (line.trim().startsWith("```")) {
+      if (inMath) {
+        mathLines.push(line);
+        return;
+      }
+      if (inCode) {
+        blocks.push(
+          <pre key={`${keyPrefix}-code-${index}`} style={styles.markdownCodeBlock}>
+            {codeLines.join("\n")}
+          </pre>,
+        );
+        codeLines = [];
+        inCode = false;
+      } else {
+        flushPlain(index);
+        inCode = true;
+      }
+      return;
+    }
+
+    if (line.trim().startsWith("$$")) {
+      if (inCode) {
+        codeLines.push(line);
+        return;
+      }
+      const trimmed = line.trim();
+      if (!inMath && trimmed.length > 4 && trimmed.endsWith("$$")) {
+        flushPlain(index);
+        blocks.push(renderMath(trimmed.slice(2, -2).trim(), true, `${keyPrefix}-math-${index}`));
+        return;
+      }
+      if (inMath) {
+        blocks.push(
+          renderMath(mathLines.join("\n").trim(), true, `${keyPrefix}-math-${index}`),
+        );
+        mathLines = [];
+        inMath = false;
+      } else {
+        flushPlain(index);
+        inMath = true;
+        const rest = trimmed.slice(2).trim();
+        if (rest) {
+          mathLines.push(rest);
+        }
+      }
+      return;
+    }
+
+    if (inCode) {
+      codeLines.push(line);
+    } else if (inMath) {
+      mathLines.push(line);
+    } else {
+      plainLines.push(line);
+    }
+  });
+
+  flushPlain(lines.length);
+  if (codeLines.length) {
+    blocks.push(
+      <pre key={`${keyPrefix}-code-tail`} style={styles.markdownCodeBlock}>
+        {codeLines.join("\n")}
+      </pre>,
+    );
+  }
+  if (mathLines.length) {
+    blocks.push(renderMath(mathLines.join("\n").trim(), true, `${keyPrefix}-math-tail`));
+  }
+
+  return <div style={styles.markdown}>{blocks}</div>;
+}
+
+function ThinkingDots() {
+  return (
+    <span aria-label="思考中" style={styles.thinkingDots}>
+      <span className="decky-ai-thinking-dot">.</span>
+      <span className="decky-ai-thinking-dot">.</span>
+      <span className="decky-ai-thinking-dot">.</span>
+    </span>
+  );
+}
+
+function compactTraceDetail(value: string, limit = 90): string {
+  const clean = value.replace(/\s+/g, " ").trim();
+  if (clean.length <= limit) {
+    return clean;
+  }
+  return `${clean.slice(0, limit - 1).trim()}…`;
+}
+
+function recommendedQuestions(answer: string, gameName?: string): string[] {
+  const text = answer.toLowerCase();
+  const target = gameName ? `这款游戏（${gameName}）` : "这款游戏";
+  if (/卡顿|掉帧|帧率|性能|stutter|fps|proton|兼容/.test(answer) || /stutter|fps/.test(text)) {
+    return [
+      `继续帮我排查${target}卡顿的最可能原因`,
+      `帮我推荐${target}的 Steam Deck 画面和功耗设置`,
+      `帮我查看${target}相关日志里有没有异常`,
+    ];
+  }
+  if (/成就|游戏库|时长|steam api|appid|游玩/.test(answer) || /achievement|playtime|library/.test(text)) {
+    return [
+      "帮我查询这款游戏的成就进度",
+      "帮我总结我在 Steam 库里的相关游玩数据",
+      "帮我根据游玩时长推荐下一步要玩的游戏",
+    ];
+  }
+  if (/报错|错误|崩溃|crash|error|日志|log/.test(answer) || /crash|error|log/.test(text)) {
+    return [
+      `继续分析${target}的报错日志`,
+      "给我一份下一步排查清单",
+      "帮我生成可以安全执行的诊断命令",
+    ];
+  }
+  return [
+    "把刚才的结论整理成可执行步骤",
+    "继续深入分析最可能的问题",
+    "还有哪些信息需要我补充？",
+  ];
+}
+
 function Content() {
   const [messages, setMessages] = useState<ChatMessage[]>(initialMessages);
   const [prompt, setPrompt] = useState("");
-  const [provider, setProvider] = useState<Provider>("mock");
   const [model, setModel] = useState("decky-local");
-  const [endpoint, setEndpoint] = useState("mock://decky-backend");
+  const [endpoint, setEndpoint] = useState("https://api.deepseek.com");
   const [apiKey, setApiKey] = useState("");
   const [hasApiKey, setHasApiKey] = useState(false);
   const [systemPrompt, setSystemPrompt] = useState(
-    "You are a concise, helpful assistant running inside Steam Deck game mode.",
+    "你是运行在 Steam Deck 游戏模式中的中文 AI 助手。请默认使用简体中文回答，除非用户明确要求其他语言。回答应简洁、具体、可执行。",
   );
   const [temperature, setTemperature] = useState(0.7);
   const [maxHistory, setMaxHistory] = useState(16);
   const [verifySsl, setVerifySsl] = useState(true);
   const [ragflowChatId, setRagflowChatId] = useState("");
   const [ragflowSessionId, setRagflowSessionId] = useState("");
+  const [steamId, setSteamId] = useState("");
+  const [steamApiKey, setSteamApiKey] = useState("");
+  const [hasSteamApiKey, setHasSteamApiKey] = useState(false);
+  const [steamIncludeFreeGames, setSteamIncludeFreeGames] = useState(true);
+  const [steamCacheSeconds, setSteamCacheSeconds] = useState(1800);
+  const [steamStatus, setSteamStatus] = useState<SteamStatus | null>(null);
+  const [activeConversation, setActiveConversation] = useState<ActiveConversation | null>(null);
+  const [isLoadingConversation, setIsLoadingConversation] = useState(false);
+  const [isDetectingSteam, setIsDetectingSteam] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -470,24 +1183,60 @@ function Content() {
   const [pairingInfo, setPairingInfo] = useState<PairingInfo | null>(null);
   const [qrDataUrl, setQrDataUrl] = useState("");
   const [pairingError, setPairingError] = useState("");
+  const [expandedTraceIds, setExpandedTraceIds] = useState<Set<string>>(() => new Set());
+  const [showScrollToBottom, setShowScrollToBottom] = useState(false);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const messagesRef = useRef<ChatMessage[]>(initialMessages);
 
   const canSend = useMemo(
     () => prompt.trim().length > 0 && !isSending,
     [isSending, prompt],
   );
 
-  const hasConversation = messages.length > 1;
+  const hasConversation = messages.length > 0;
+
+  const updateScrollButton = () => {
+    const transcript = transcriptRef.current;
+    if (!transcript) {
+      return;
+    }
+    const distanceFromBottom =
+      transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight;
+    setShowScrollToBottom(distanceFromBottom > 120);
+  };
+
+  const scrollToBottom = (behavior: ScrollBehavior = "smooth") => {
+    const transcript = transcriptRef.current;
+    if (!transcript) {
+      return;
+    }
+    transcript.scrollTo({
+      top: transcript.scrollHeight,
+      behavior,
+    });
+    setShowScrollToBottom(false);
+  };
 
   useEffect(() => {
-    transcriptRef.current?.scrollTo({
-      top: transcriptRef.current.scrollHeight,
-      behavior: "smooth",
-    });
+    const transcript = transcriptRef.current;
+    if (!transcript) {
+      messagesRef.current = messages;
+      return;
+    }
+
+    const distanceFromBottom =
+      transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight;
+    if (isSending || distanceFromBottom < 160) {
+      scrollToBottom("smooth");
+    } else {
+      updateScrollButton();
+    }
+    messagesRef.current = messages;
   }, [isSending, messages]);
 
   useEffect(() => {
     void loadConfig();
+    void loadActiveConversation();
   }, []);
 
   useEffect(() => {
@@ -498,8 +1247,7 @@ function Content() {
   }, [showPairing]);
 
   const applyConfig = (config: BackendConfig) => {
-    setProvider(config.provider || "mock");
-    setEndpoint(config.endpoint || "mock://decky-backend");
+    setEndpoint(config.endpoint || "https://api.deepseek.com");
     setModel(config.model || "decky-local");
     setSystemPrompt(config.system_prompt || "");
     setTemperature(Number(config.temperature ?? 0.7));
@@ -508,6 +1256,11 @@ function Content() {
     setRagflowChatId(config.ragflow_chat_id || "");
     setRagflowSessionId(config.ragflow_session_id || "");
     setHasApiKey(Boolean(config.has_api_key));
+    setSteamId(config.steam_id || "");
+    setSteamIncludeFreeGames(Boolean(config.steam_include_free_games ?? true));
+    setSteamCacheSeconds(Number(config.steam_cache_seconds ?? 1800));
+    setHasSteamApiKey(Boolean(config.has_steam_api_key));
+    setSteamApiKey("");
     setApiKey("");
   };
 
@@ -516,13 +1269,35 @@ function Content() {
       applyConfig(await getConfig());
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : "Failed to load backend config";
-      toaster.toast({ title: "AI Chat config failed", body: message });
+        error instanceof Error ? error.message : "后端配置加载失败";
+      toaster.toast({ title: "配置加载失败", body: message });
+    }
+  };
+
+  const loadActiveConversation = async () => {
+    setIsLoadingConversation(true);
+    try {
+      const conversation = await getActiveConversation();
+      setActiveConversation(conversation);
+      const restoredMessages = conversation.messages.map((message, index) => ({
+        id: id(`restored-${message.role}-${index}`),
+        role: message.role,
+        text: message.text,
+      }));
+      setMessages(restoredMessages);
+      messagesRef.current = restoredMessages;
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "会话加载失败";
+      toaster.toast({ title: "会话加载失败", body: message });
+    } finally {
+      setIsLoadingConversation(false);
     }
   };
 
   const configPayload = (includeApiKey: boolean) => ({
-    provider,
+    mode: "agent",
+    provider: "claude-code-cli",
     endpoint,
     model,
     api_key: includeApiKey ? apiKey : "__KEEP__",
@@ -532,17 +1307,21 @@ function Content() {
     verify_ssl: verifySsl,
     ragflow_chat_id: ragflowChatId,
     ragflow_session_id: ragflowSessionId,
+    steam_id: steamId,
+    steam_api_key: steamApiKey.length > 0 ? steamApiKey : "__KEEP__",
+    steam_include_free_games: steamIncludeFreeGames,
+    steam_cache_seconds: steamCacheSeconds,
   });
 
   const saveSettings = async () => {
     setIsSaving(true);
     try {
       applyConfig(await saveConfig(configPayload(apiKey.length > 0)));
-      toaster.toast({ title: "AI Chat settings saved", body: "Configuration updated." });
+      toaster.toast({ title: "设置已保存", body: "已更新后端配置。" });
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : "Failed to save settings";
-      toaster.toast({ title: "AI Chat save failed", body: message });
+        error instanceof Error ? error.message : "设置保存失败";
+      toaster.toast({ title: "设置保存失败", body: message });
     } finally {
       setIsSaving(false);
     }
@@ -552,13 +1331,41 @@ function Content() {
     try {
       const status = await checkBackend(configPayload(apiKey.length > 0));
       toaster.toast({
-        title: status.ok ? "Backend ready" : "Backend not ready",
+        title: status.ok ? "后端配置可用" : "后端配置不可用",
         body: status.message,
       });
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : "Failed to check backend";
-      toaster.toast({ title: "AI Chat test failed", body: message });
+        error instanceof Error ? error.message : "后端检查失败";
+      toaster.toast({ title: "后端测试失败", body: message });
+    }
+  };
+
+  const connectSteam = async () => {
+    setIsDetectingSteam(true);
+    try {
+      const status = await detectSteamStatus();
+      setSteamStatus(status);
+      if (status.steam_id) {
+        setSteamId(status.steam_id);
+        setHasSteamApiKey(Boolean(status.has_api_key));
+        toaster.toast({
+          title: "Steam 已连接",
+          body: `检测到 SteamID64：${status.steam_id}`,
+        });
+      } else {
+        toaster.toast({
+          title: "未检测到 Steam 账号",
+          body: status.message || status.detected?.message || "请确认 Steam 已在此 Deck 登录过。",
+        });
+      }
+      await loadConfig();
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Steam 连接失败";
+      toaster.toast({ title: "Steam 连接失败", body: message });
+    } finally {
+      setIsDetectingSteam(false);
     }
   };
 
@@ -583,14 +1390,14 @@ function Content() {
         }));
       } catch (error) {
         const message =
-          error instanceof Error ? error.message : "QR generation failed";
-        setPairingError(`QR generation failed: ${message}`);
+          error instanceof Error ? error.message : "二维码生成失败";
+        setPairingError(`二维码生成失败：${message}`);
       }
     } catch (error) {
       const message =
-        error instanceof Error ? error.message : "Failed to open phone setup";
+        error instanceof Error ? error.message : "无法打开手机配置页";
       setPairingError(message);
-      toaster.toast({ title: "Phone setup failed", body: message });
+      toaster.toast({ title: "手机配置页打开失败", body: message });
     }
   };
 
@@ -608,40 +1415,105 @@ function Content() {
 
     setPrompt("");
     setIsSending(true);
-    setMessages((current) => [...current, userMessage]);
+    const assistantId = id("assistant-stream");
+    const streamingMessage: ChatMessage = {
+      id: assistantId,
+      role: "assistant",
+      text: "正在启动 Claude Code...",
+      toolEvents: [
+        {
+          name: "Claude Code",
+          status: "start",
+          detail: "正在启动内置 Claude Code CLI，并准备联网查询权限。",
+        },
+      ],
+    };
+    setMessages((current) => [...current, userMessage, streamingMessage]);
 
     try {
       const history = [...messages, userMessage].map(({ role, text }) => ({
         role,
         text,
       }));
-      const response = await askAi({
+      const start = await startAiStream({
         prompt: cleanPrompt,
+        conversation_id: activeConversation?.conversation_id,
+        claude_session_id: activeConversation?.claude_session_id,
+        game: activeConversation?.game,
         history,
       });
+      if (!start.ok || !start.stream_id) {
+        throw new Error(start.message || "无法启动 Claude Code 流式会话");
+      }
 
-      const assistantMessage: ChatMessage = {
-        id: id(response.ok ? "assistant" : "error"),
-        role: "assistant",
-        text: response.message,
-        error: !response.ok,
-      };
-      setMessages((current) => [...current, assistantMessage]);
+      let cursor = 0;
+      const allEvents: ToolEvent[] = [...(streamingMessage.toolEvents || [])];
+      for (;;) {
+        await sleep(500);
+        const poll = await pollAiStream(start.stream_id, cursor);
+        if (!poll.ok) {
+          throw new Error(poll.message || "Claude Code 流式会话读取失败");
+        }
+        cursor = poll.cursor;
+        if (poll.events?.length) {
+          allEvents.push(...poll.events);
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === assistantId
+                ? {
+                    ...message,
+                    text: "正在处理，请稍候...",
+                    toolEvents: [...allEvents],
+                  }
+                : message,
+            ),
+          );
+        }
+        if (poll.done) {
+          const response = poll.response;
+          if (!response) {
+            throw new Error("Claude Code 流式会话结束但没有返回最终结果");
+          }
+          const finalEvents = allEvents.length
+            ? allEvents
+            : response.metadata?.tool_events;
+          setMessages((current) =>
+            current.map((message) =>
+              message.id === assistantId
+                ? {
+                    ...message,
+                    id: id(response.ok ? "assistant" : "error"),
+                    text: response.message,
+                    error: !response.ok,
+                    toolEvents: finalEvents,
+                    suggestions: response.ok
+                      ? recommendedQuestions(response.message, activeConversation?.game?.name)
+                      : undefined,
+                  }
+                : message,
+            ),
+          );
+          break;
+        }
+      }
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Unknown backend error";
 
-      setMessages((current) => [
-        ...current,
-        {
-          id: id("error"),
-          role: "assistant",
-          text: `Backend call failed: ${message}`,
-          error: true,
-        },
-      ]);
+      setMessages((current) =>
+        current.map((item) =>
+          item.id === assistantId
+            ? {
+                ...item,
+                id: id("error"),
+                text: `后端调用失败：${message}`,
+                error: true,
+              }
+            : item,
+        ),
+      );
       toaster.toast({
-        title: "AI Chat request failed",
+        title: "请求失败",
         body: message,
       });
     } finally {
@@ -651,6 +1523,18 @@ function Content() {
 
   const onPromptFieldChange = (event: ChangeEvent<HTMLInputElement>) => {
     setPrompt(event.target.value);
+  };
+
+  const toggleTrace = (messageId: string) => {
+    setExpandedTraceIds((current) => {
+      const next = new Set(current);
+      if (next.has(messageId)) {
+        next.delete(messageId);
+      } else {
+        next.add(messageId);
+      }
+      return next;
+    });
   };
 
   const onPromptKeyDown = (
@@ -663,28 +1547,23 @@ function Content() {
   };
 
   return (
-    <div style={styles.shell}>
+    <div className="decky-ai-chat-shell" style={styles.shell}>
+      <style>{inputCss}</style>
       <header style={styles.topBar}>
         <div style={styles.modelBlock}>
-          <div style={styles.modelTitle}>AI Chat</div>
+          <div style={styles.modelTitle}>AI 助手</div>
           <div style={styles.modelStatus}>
             <FaWifi />
             <span>
-              {model} · {provider}
+              {activeConversation?.game?.name
+                ? `当前游戏：${activeConversation.game.name}`
+                : activeConversation?.title || `Claude Code CLI · ${model}`}
             </span>
           </div>
         </div>
         <div style={styles.topActions}>
           <button
-            aria-label="New chat"
-            style={styles.iconButton}
-            type="button"
-            onClick={() => setMessages(initialMessages)}
-          >
-            <FaPlus />
-          </button>
-          <button
-            aria-label="Phone setup"
+            aria-label="手机扫码配置"
             style={styles.iconButton}
             type="button"
             onClick={() => {
@@ -695,7 +1574,7 @@ function Content() {
             <FaQrcode />
           </button>
           <button
-            aria-label="Connection settings"
+            aria-label="连接设置"
             style={styles.iconButton}
             type="button"
             onClick={() => {
@@ -716,17 +1595,17 @@ function Content() {
 
       {showPairing ? (
         <section style={styles.pairingPanel}>
-          <h2 style={styles.pairingTitle}>Phone Setup</h2>
+          <h2 style={styles.pairingTitle}>手机配置</h2>
           <p style={styles.pairingText}>
             用手机扫描二维码，在同一个 Wi-Fi 下填写 DeepSeek、Kimi 或自定义
-            OpenAI-compatible 配置。
+            OpenAI 兼容接口配置，也可以填写 Steam Web API Key。
           </p>
           <div style={styles.qrBox}>
             {qrDataUrl ? (
               <img alt="Phone setup QR code" src={qrDataUrl} style={styles.qrImage} />
             ) : (
               <span style={{ color: "#151515", textAlign: "center" }}>
-                {pairingError ? "QR unavailable" : "Loading"}
+                {pairingError ? "二维码不可用" : "加载中"}
               </span>
             )}
           </div>
@@ -736,14 +1615,14 @@ function Content() {
             </div>
           ) : null}
           <div style={styles.pairingUrl}>
-            {pairingInfo?.url || "Starting phone setup server..."}
+            {pairingInfo?.url || "正在启动手机配置服务..."}
           </div>
           <button
             style={styles.actionButton}
             type="button"
             onClick={() => void loadPairingInfo()}
           >
-            Refresh
+            刷新二维码
           </button>
           <button
             style={styles.actionButton}
@@ -751,12 +1630,12 @@ function Content() {
             onClick={() => {
               void loadConfig();
               toaster.toast({
-                title: "AI Chat config reloaded",
-                body: "Settings refreshed from backend config.",
+                title: "配置已刷新",
+                body: "已从后端配置重新同步。",
               });
             }}
           >
-            Reload Config
+            重新同步配置
           </button>
           <p style={styles.settingsNote}>
             此页面带随机 token，只适合在可信局域网内使用。保存后可关闭手机页面。
@@ -766,21 +1645,79 @@ function Content() {
 
       {showSettings ? (
         <section style={styles.settingsPanel}>
-          <label style={styles.field}>
-            <span style={styles.label}>Provider</span>
-            <select
-              style={styles.select}
-              value={provider}
-              onChange={(event) => setProvider(event.target.value as Provider)}
+          <p style={styles.settingsNote}>
+            当前固定为 Agent 工具模式。写文件和 shell 命令会先生成待确认动作，不会自动执行。
+          </p>
+          <div style={styles.toolResult}>
+            <div style={styles.toolResultTitle}>Steam 账号连接</div>
+            <p style={styles.settingsNote}>
+              优先自动读取这台 Steam Deck 上已登录的 SteamID64。完整游戏库、时长和成就可能需要公开资料或可选 Web API Key。
+            </p>
+            <div style={styles.settingsNote}>
+              状态：
+              {steamId ? ` 已连接 ${steamId}` : " 未连接"}
+              {hasSteamApiKey ? " · API Key 已保存" : ""}
+              {steamStatus ? ` · 本机已安装 ${steamStatus.local_library_count} 个游戏` : ""}
+            </div>
+            <button
+              style={styles.actionButton}
+              type="button"
+              onClick={() => void connectSteam()}
             >
-              <option value="mock">Mock</option>
-              <option value="openai">OpenAI-compatible HTTP</option>
-              <option value="langchain">LangChain ChatOpenAI</option>
-              <option value="ragflow">RAGFlow chat</option>
-            </select>
-          </label>
+              <FaCheck /> {isDetectingSteam ? "检测中" : "连接 Steam（自动检测）"}
+            </button>
+            <label style={styles.field}>
+              <span style={styles.label}>SteamID64</span>
+              <input
+                style={styles.input}
+                value={steamId}
+                onChange={(event) => setSteamId(event.target.value)}
+                placeholder="自动检测后会填入，也可以手动修正"
+              />
+            </label>
+            <label style={styles.field}>
+              <span style={styles.label}>
+                Steam Web API Key {hasSteamApiKey ? "（已保存，可选）" : "（可选）"}
+              </span>
+              <input
+                style={styles.input}
+                type="password"
+                value={steamApiKey}
+                onChange={(event) => setSteamApiKey(event.target.value)}
+                placeholder={hasSteamApiKey ? "留空则保留已保存的 key" : "需要私有库/成就时再填写"}
+              />
+            </label>
+            <label style={{ ...styles.field, flexDirection: "row", alignItems: "center" }}>
+              <input
+                checked={steamIncludeFreeGames}
+                type="checkbox"
+                onChange={(event) => setSteamIncludeFreeGames(event.target.checked)}
+              />
+              <span style={styles.label}>Steam 库包含免费游戏</span>
+            </label>
+            <label style={styles.field}>
+              <span style={styles.label}>Steam 数据缓存秒数</span>
+              <input
+                style={styles.input}
+                type="number"
+                min={60}
+                max={86400}
+                step={60}
+                value={steamCacheSeconds}
+                onChange={(event) => setSteamCacheSeconds(Number(event.target.value))}
+              />
+            </label>
+          </div>
+          <div style={styles.toolResult}>
+            <div style={styles.toolResultTitle}>Agent 后端</div>
+            <p style={styles.settingsNote}>
+              当前后端固定为 Claude Code CLI。请先在 Steam Deck 上安装并登录
+              Claude Code；插件会从 Decky 后端调用 `claude -p`，并授予
+              `/home/deck` 访问目录。
+            </p>
+          </div>
           <label style={styles.field}>
-            <span style={styles.label}>Endpoint / Base URL</span>
+            <span style={styles.label}>接口地址 / Base URL</span>
             <input
               style={styles.input}
               value={endpoint}
@@ -789,7 +1726,7 @@ function Content() {
             />
           </label>
           <label style={styles.field}>
-            <span style={styles.label}>Model</span>
+            <span style={styles.label}>模型</span>
             <input
               style={styles.input}
               value={model}
@@ -798,18 +1735,18 @@ function Content() {
           </label>
           <label style={styles.field}>
             <span style={styles.label}>
-              API Key {hasApiKey ? "(saved)" : ""}
+              API Key {hasApiKey ? "（已保存）" : ""}
             </span>
             <input
               style={styles.input}
               type="password"
               value={apiKey}
               onChange={(event) => setApiKey(event.target.value)}
-              placeholder={hasApiKey ? "Leave blank to keep saved key" : "Bearer token"}
+              placeholder={hasApiKey ? "留空则保留已保存的 key" : "Bearer token"}
             />
           </label>
           <label style={styles.field}>
-            <span style={styles.label}>System Prompt</span>
+            <span style={styles.label}>系统提示词</span>
             <textarea
               style={{ ...styles.input, minHeight: "54px", resize: "vertical" }}
               value={systemPrompt}
@@ -817,7 +1754,7 @@ function Content() {
             />
           </label>
           <label style={styles.field}>
-            <span style={styles.label}>Temperature</span>
+            <span style={styles.label}>温度</span>
             <input
               style={styles.input}
               type="number"
@@ -829,7 +1766,7 @@ function Content() {
             />
           </label>
           <label style={styles.field}>
-            <span style={styles.label}>Max History Messages</span>
+            <span style={styles.label}>最大历史消息数</span>
             <input
               style={styles.input}
               type="number"
@@ -846,84 +1783,61 @@ function Content() {
               type="checkbox"
               onChange={(event) => setVerifySsl(event.target.checked)}
             />
-            <span style={styles.label}>Verify TLS certificate</span>
+            <span style={styles.label}>校验 TLS 证书</span>
           </label>
-          {provider === "ragflow" ? (
-            <>
-              <label style={styles.field}>
-                <span style={styles.label}>RAGFlow Chat ID</span>
-                <input
-                  style={styles.input}
-                  value={ragflowChatId}
-                  onChange={(event) => setRagflowChatId(event.target.value)}
-                />
-              </label>
-              <label style={styles.field}>
-                <span style={styles.label}>RAGFlow Session ID</span>
-                <input
-                  style={styles.input}
-                  value={ragflowSessionId}
-                  onChange={(event) => setRagflowSessionId(event.target.value)}
-                />
-              </label>
-            </>
-          ) : null}
           <div style={styles.settingsActions}>
             <button
               style={styles.actionButton}
               type="button"
               onClick={() => void saveSettings()}
             >
-              <FaSave /> {isSaving ? "Saving" : "Save"}
+              <FaSave /> {isSaving ? "保存中" : "保存"}
             </button>
             <button
               style={styles.actionButton}
               type="button"
               onClick={() => void testBackend()}
             >
-              <FaCheck /> Test
+              <FaCheck /> 测试
             </button>
           </div>
           <p style={styles.settingsNote}>
-            OpenAI-compatible expects a `/chat/completions` API. RAGFlow expects
-            a base URL plus chat/session ids. LangChain requires Python package
-            installation on the Deck.
+            当前所有请求都会进入 Claude Code CLI Bridge。上面的模型服务字段仅保留为旧配置和系统提示词入口，不再驱动主 Agent。
           </p>
         </section>
       ) : null}
 
-      <main ref={transcriptRef} style={styles.transcript}>
+      <main ref={transcriptRef} style={styles.transcript} onScroll={updateScrollButton}>
         {!hasConversation ? (
           <div style={styles.emptyState}>
-            <div style={styles.hero}>
-              <div style={styles.heroMark}>
-                <FaRobot />
+            {isLoadingConversation ? (
+              <div style={{ ...styles.bubble, ...styles.assistantMessage }}>
+                正在加载当前游戏会话
+                <ThinkingDots />
               </div>
-              <h2 style={styles.heroTitle}>How can I help?</h2>
-              <p style={styles.heroText}>
-                Ask for game settings, walkthrough hints, launch options, or
-                anything you need while staying in game mode.
-              </p>
-            </div>
-            <div style={styles.suggestionGrid}>
-              {quickPrompts.map((quickPrompt) => (
-                <button
-                  key={quickPrompt}
-                  style={styles.suggestionButton}
-                  type="button"
-                  onClick={() => {
-                    setPrompt(quickPrompt);
-                    void sendPrompt(quickPrompt);
-                  }}
-                >
-                  {quickPrompt}
-                </button>
-              ))}
-            </div>
+            ) : (
+              <div style={styles.suggestionGrid}>
+                {quickPrompts.map((quickPrompt) => (
+                  <button
+                    key={quickPrompt}
+                    style={styles.suggestionButton}
+                    type="button"
+                    onClick={() => {
+                      setPrompt(quickPrompt);
+                      void sendPrompt(quickPrompt);
+                    }}
+                  >
+                    {quickPrompt}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         ) : (
           messages.map((message) => {
             const isUser = message.role === "user";
+            const isStreamingMessage = message.id.startsWith("assistant-stream");
+            const traceExpanded = isStreamingMessage || expandedTraceIds.has(message.id);
             const rowStyle = {
               ...styles.messageRow,
               ...(isUser ? styles.userRow : {}),
@@ -941,7 +1855,55 @@ function Content() {
                     <FaRobot />
                   </div>
                 ) : null}
-                <div style={bubbleStyle}>{message.text}</div>
+                <div style={bubbleStyle}>
+                  {isUser ? (
+                    <div style={{ whiteSpace: "pre-wrap" }}>{message.text}</div>
+                  ) : (
+                    renderMarkdown(message.text, message.id)
+                  )}
+                  {!isUser && message.toolEvents?.length ? (
+                    <>
+                      {!isStreamingMessage ? (
+                        <button
+                          style={styles.toolTraceToggle}
+                          type="button"
+                          onClick={() => toggleTrace(message.id)}
+                        >
+                          <span>
+                            思考过程 · {message.toolEvents.length} 个步骤
+                          </span>
+                          <span>{traceExpanded ? "收起" : "展开"}</span>
+                        </button>
+                      ) : null}
+                      {traceExpanded ? (
+                        <div style={styles.toolTrace}>
+                          {message.toolEvents.map((event, index) => (
+                            <div key={`${message.id}-tool-${index}`} style={styles.toolEvent}>
+                              <strong>{event.name}</strong> · {event.status}
+                              <br />
+                              {compactTraceDetail(event.detail)}
+                            </div>
+                          ))}
+                        </div>
+                      ) : null}
+                    </>
+                  ) : null}
+                  {!isUser && message.suggestions?.length ? (
+                    <div style={styles.suggestionRow}>
+                      <div style={styles.suggestionTitle}>可以继续问：</div>
+                      {message.suggestions.map((question) => (
+                        <button
+                          key={`${message.id}-suggestion-${question}`}
+                          style={styles.followupButton}
+                          type="button"
+                          onClick={() => setPrompt(question)}
+                        >
+                          {question}
+                        </button>
+                      ))}
+                    </div>
+                  ) : null}
+                </div>
               </div>
             );
           })
@@ -953,25 +1915,45 @@ function Content() {
               <FaRobot />
             </div>
             <div style={{ ...styles.bubble, ...styles.assistantMessage }}>
-              <span style={styles.typing}>Thinking...</span>
+              <span style={styles.typing}>
+                思考中
+                <ThinkingDots />
+              </span>
             </div>
           </div>
         ) : null}
       </main>
 
+      {showScrollToBottom ? (
+        <button
+          aria-label="跳转到最新消息"
+          style={styles.scrollToBottomButton}
+          type="button"
+          onClick={() => scrollToBottom("smooth")}
+        >
+          <FaArrowDown />
+        </button>
+      ) : null}
+
       <footer style={styles.composerWrap}>
         <div style={styles.composer}>
           <button
-            aria-label="Clear conversation"
+            aria-label="清空对话"
             style={styles.iconButton}
             type="button"
-            onClick={() => setMessages(initialMessages)}
+            onClick={async () => {
+              const cleared = await clearActiveConversation(activeConversation?.conversation_id);
+              setActiveConversation(cleared);
+              setMessages([]);
+              messagesRef.current = [];
+              setExpandedTraceIds(new Set());
+            }}
           >
             <FaTrash />
           </button>
-          <div style={styles.textFieldWrap}>
+          <div className="decky-ai-chat-input" style={styles.textFieldWrap}>
             <TextField
-              aria-label="Chat prompt"
+              aria-label="聊天输入"
               style={styles.compactTextField}
               value={prompt}
               onChange={onPromptFieldChange}
@@ -980,7 +1962,7 @@ function Content() {
             />
           </div>
           <button
-            aria-label="Send message"
+            aria-label="发送消息"
             disabled={!canSend}
             style={{
               ...styles.sendButton,
@@ -992,7 +1974,6 @@ function Content() {
             <FaArrowUp />
           </button>
         </div>
-        <div style={styles.composerHint}>Press Enter or the arrow button to send</div>
       </footer>
     </div>
   );
@@ -1002,8 +1983,8 @@ export default definePlugin(() => {
   console.log("AI Chat plugin initializing");
 
   return {
-    name: "AI Chat",
-    titleView: <div className={staticClasses.Title}>AI Chat</div>,
+    name: "AI 助手",
+    titleView: <div className={staticClasses.Title}>AI 助手</div>,
     content: <Content />,
     icon: <FaRobot />,
     onDismount() {
